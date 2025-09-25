@@ -150,6 +150,19 @@ static bool is_ereg(u32 reg)
 			     BIT(BPF_REG_AX));
 }
 
+/*
+ * is_ereg_8l() == true if BPF register 'reg' is mapped to access x86-64
+ * lower 8-bit registers dil,sil,bpl,spl,r8b..r15b, which need extra byte
+ * of encoding. al,cl,dl,bl have simpler encoding.
+ */
+static bool is_ereg_8l(u32 reg)
+{
+	return is_ereg(reg) ||
+	    (1 << reg) & (BIT(BPF_REG_1) |
+			  BIT(BPF_REG_2) |
+			  BIT(BPF_REG_FP));
+}
+
 /* add modifiers if 'reg' maps to x64 registers r8..r15 */
 static u8 add_1mod(u8 byte, u32 reg)
 {
@@ -488,13 +501,6 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image,
 			break;
 
 		case BPF_LD | BPF_IMM | BPF_DW:
-			if (insn[1].code != 0 || insn[1].src_reg != 0 ||
-			    insn[1].dst_reg != 0 || insn[1].off != 0) {
-				/* verifier must catch invalid insns */
-				pr_err("invalid BPF_LD_IMM64 insn\n");
-				return -EINVAL;
-			}
-
 			/* optimization: if imm64 is zero, use 'xor <dst>,<dst>'
 			 * to save 7 bytes.
 			 */
@@ -771,9 +777,8 @@ st:			if (is_imm8(insn->off))
 			/* STX: *(u8*)(dst_reg + off) = src_reg */
 		case BPF_STX | BPF_MEM | BPF_B:
 			/* emit 'mov byte ptr [rax + off], al' */
-			if (is_ereg(dst_reg) || is_ereg(src_reg) ||
-			    /* have to add extra byte for x86 SIL, DIL regs */
-			    src_reg == BPF_REG_1 || src_reg == BPF_REG_2)
+			if (is_ereg(dst_reg) || is_ereg_8l(src_reg))
+				/* Add extra byte for eregs or SIL,DIL,BPL in src_reg */
 				EMIT2(add_2mod(0x40, dst_reg, src_reg), 0x88);
 			else
 				EMIT1(0x88);
@@ -851,7 +856,7 @@ xadd:			if (is_imm8(insn->off))
 			func = (u8 *) __bpf_call_base + imm32;
 			jmp_offset = func - (image + addrs[i]);
 			if (seen_ld_abs) {
-				reload_skb_data = bpf_helper_changes_skb_data(func);
+				reload_skb_data = bpf_helper_changes_pkt_data(func);
 				if (reload_skb_data) {
 					EMIT1(0x57); /* push %rdi */
 					jmp_offset += 22; /* pop, mov, sub, mov */
@@ -881,7 +886,7 @@ xadd:			if (is_imm8(insn->off))
 			}
 			break;
 
-		case BPF_JMP | BPF_CALL | BPF_X:
+		case BPF_JMP | BPF_TAIL_CALL:
 			emit_bpf_tail_call(&prog);
 			break;
 
@@ -1065,12 +1070,21 @@ common_load:
 
 		ilen = prog - temp;
 		if (ilen > BPF_MAX_INSN_SIZE) {
-			pr_err("bpf_jit_compile fatal insn size error\n");
+			pr_err("bpf_jit: fatal insn size error\n");
 			return -EFAULT;
 		}
 
 		if (image) {
-			if (unlikely(proglen + ilen > oldproglen)) {
+			/*
+			 * When populating the image, assert that:
+			 *
+			 *  i) We do not write beyond the allocated space, and
+			 * ii) addrs[i] did not change from the prior run, in order
+			 *     to validate assumptions made for computing branch
+			 *     displacements.
+			 */
+			if (unlikely(proglen + ilen > oldproglen ||
+				     proglen + ilen != addrs[i])) {
 				pr_err("bpf_jit_compile fatal error\n");
 				return -EFAULT;
 			}
@@ -1083,23 +1097,29 @@ common_load:
 	return proglen;
 }
 
-void bpf_jit_compile(struct bpf_prog *prog)
-{
-}
+struct x64_jit_data {
+	struct bpf_binary_header *header;
+	int *addrs;
+	u8 *image;
+	int proglen;
+	struct jit_context ctx;
+};
 
 struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 {
 	struct bpf_binary_header *header = NULL;
 	struct bpf_prog *tmp, *orig_prog = prog;
+	struct x64_jit_data *jit_data;
 	int proglen, oldproglen = 0;
 	struct jit_context ctx = {};
 	bool tmp_blinded = false;
+	bool extra_pass = false;
 	u8 *image = NULL;
 	int *addrs;
 	int pass;
 	int i;
 
-	if (!bpf_jit_enable)
+	if (!prog->jit_requested)
 		return orig_prog;
 
 	tmp = bpf_jit_blind_constants(prog);
@@ -1113,10 +1133,28 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		prog = tmp;
 	}
 
+	jit_data = prog->aux->jit_data;
+	if (!jit_data) {
+		jit_data = kzalloc(sizeof(*jit_data), GFP_KERNEL);
+		if (!jit_data) {
+			prog = orig_prog;
+			goto out;
+		}
+		prog->aux->jit_data = jit_data;
+	}
+	addrs = jit_data->addrs;
+	if (addrs) {
+		ctx = jit_data->ctx;
+		oldproglen = jit_data->proglen;
+		image = jit_data->image;
+		header = jit_data->header;
+		extra_pass = true;
+		goto skip_init_addrs;
+	}
 	addrs = kmalloc(prog->len * sizeof(*addrs), GFP_KERNEL);
 	if (!addrs) {
 		prog = orig_prog;
-		goto out;
+		goto out_addrs;
 	}
 
 	/* Before first pass, make a rough estimation of addrs[]
@@ -1127,6 +1165,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		addrs[i] = proglen;
 	}
 	ctx.cleanup_addr = proglen;
+skip_init_addrs:
 
 	/* JITed image shrinks with every pass and the loop iterates
 	 * until the image stops shrinking. Very large bpf programs
@@ -1168,33 +1207,31 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 
 	if (image) {
 		bpf_flush_icache(header, image + proglen);
-		set_memory_ro((unsigned long)header, header->pages);
+		if (!prog->is_func || extra_pass) {
+			bpf_jit_binary_lock_ro(header);
+		} else {
+			jit_data->addrs = addrs;
+			jit_data->ctx = ctx;
+			jit_data->proglen = proglen;
+			jit_data->image = image;
+			jit_data->header = header;
+		}
 		prog->bpf_func = (void *)image;
 		prog->jited = 1;
+		prog->jited_len = proglen;
 	} else {
 		prog = orig_prog;
 	}
 
+	if (!prog->is_func || extra_pass) {
 out_addrs:
-	kfree(addrs);
+		kfree(addrs);
+		kfree(jit_data);
+		prog->aux->jit_data = NULL;
+	}
 out:
 	if (tmp_blinded)
 		bpf_jit_prog_release_other(prog, prog == orig_prog ?
 					   tmp : orig_prog);
 	return prog;
-}
-
-void bpf_jit_free(struct bpf_prog *fp)
-{
-	unsigned long addr = (unsigned long)fp->bpf_func & PAGE_MASK;
-	struct bpf_binary_header *header = (void *)addr;
-
-	if (!fp->jited)
-		goto free_filter;
-
-	set_memory_rw(addr, header->pages);
-	bpf_jit_binary_free(header);
-
-free_filter:
-	bpf_prog_unlock_free(fp);
 }

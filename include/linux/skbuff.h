@@ -412,14 +412,16 @@ struct ubuf_info {
  * the end of the header data, ie. at skb->end.
  */
 struct skb_shared_info {
-	unsigned char	nr_frags;
+	__u8		__unused;
+	__u8		meta_len;
+	__u8		nr_frags;
 	__u8		tx_flags;
 	unsigned short	gso_size;
 	/* Warning: this field is not always filled in (UFO)! */
 	unsigned short	gso_segs;
-	unsigned short  gso_type;
 	struct sk_buff	*frag_list;
 	struct skb_shared_hwtstamps hwtstamps;
+	unsigned int	gso_type;
 	u32		tskey;
 	__be32          ip6_frag_id;
 
@@ -665,7 +667,11 @@ struct sk_buff {
 	 * want to keep them across layers you have to do a skb_clone()
 	 * first. This is owned by whoever has the skb queued ATM.
 	 */
+#ifdef CONFIG_MPTCP
+	char			cb[72] __aligned(8);
+#else
 	char			cb[48] __aligned(8);
+#endif
 
 	unsigned long		_skb_refdst;
 	void			(*destructor)(struct sk_buff *skb);
@@ -784,9 +790,7 @@ struct sk_buff {
 	__u32		secmark;
 #endif
 
-#if defined(CONFIG_MODEM_IF_LEGACY_QOS) || defined(CONFIG_MODEM_IF_QOS)
 	__u32			priomark;
-#endif
 
 	union {
 		__u32		mark;
@@ -985,6 +989,7 @@ static inline struct sk_buff *alloc_skb_head(gfp_t priority)
 struct sk_buff *skb_morph(struct sk_buff *dst, struct sk_buff *src);
 int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask);
 struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t priority);
+void skb_copy_header(struct sk_buff *new, const struct sk_buff *old);
 struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t priority);
 struct sk_buff *__pskb_copy_fclone(struct sk_buff *skb, int headroom,
 				   gfp_t gfp_mask, bool fclone);
@@ -1560,6 +1565,18 @@ static inline __u32 skb_queue_len(const struct sk_buff_head *list_)
 }
 
 /**
+ *	skb_queue_len_lockless	- get queue length
+ *	@list_: list to measure
+ *
+ *	Return the length of an &sk_buff queue.
+ *	This variant can be used in lockless contexts.
+ */
+static inline __u32 skb_queue_len_lockless(const struct sk_buff_head *list_)
+{
+	return READ_ONCE(list_->qlen);
+}
+
+/**
  *	__skb_queue_head_init - initialize non-spinlock portions of sk_buff_head
  *	@list: queue to initialize
  *
@@ -1611,7 +1628,7 @@ static inline void __skb_insert(struct sk_buff *newsk,
 	newsk->next = next;
 	newsk->prev = prev;
 	next->prev  = prev->next = newsk;
-	list->qlen++;
+	WRITE_ONCE(list->qlen, list->qlen + 1);
 }
 
 static inline void __skb_queue_splice(const struct sk_buff_head *list,
@@ -1762,7 +1779,7 @@ static inline void __skb_unlink(struct sk_buff *skb, struct sk_buff_head *list)
 {
 	struct sk_buff *next, *prev;
 
-	list->qlen--;
+	WRITE_ONCE(list->qlen, list->qlen - 1);
 	next	   = skb->next;
 	prev	   = skb->prev;
 	skb->next  = skb->prev = NULL;
@@ -2185,6 +2202,11 @@ static inline unsigned char *skb_mac_header(const struct sk_buff *skb)
 	return skb->head + skb->mac_header;
 }
 
+static inline u32 skb_mac_header_len(const struct sk_buff *skb)
+{
+	return skb->network_header - skb->mac_header;
+}
+
 static inline int skb_mac_header_was_set(const struct sk_buff *skb)
 {
 	return skb->mac_header != (typeof(skb->mac_header))~0U;
@@ -2487,7 +2509,7 @@ static inline struct sk_buff *netdev_alloc_skb_ip_align(struct net_device *dev,
 
 static inline void skb_free_frag(void *addr)
 {
-	__free_page_frag(addr);
+	page_frag_free(addr);
 }
 
 void *napi_alloc_frag(unsigned int fragsz);
@@ -2805,7 +2827,7 @@ static inline int skb_padto(struct sk_buff *skb, unsigned int len)
  *	is untouched. Otherwise it is extended. Returns zero on
  *	success. The skb is freed on error.
  */
-static inline int skb_put_padto(struct sk_buff *skb, unsigned int len)
+static inline int __must_check skb_put_padto(struct sk_buff *skb, unsigned int len)
 {
 	unsigned int size = skb->len;
 
@@ -3104,6 +3126,9 @@ __wsum skb_copy_and_csum_bits(const struct sk_buff *skb, int offset, u8 *to,
 int skb_splice_bits(struct sk_buff *skb, struct sock *sk, unsigned int offset,
 		    struct pipe_inode_info *pipe, unsigned int len,
 		    unsigned int flags);
+int skb_send_sock_locked(struct sock *sk, struct sk_buff *skb, int offset,
+			 int len);
+int skb_send_sock(struct sock *sk, struct sk_buff *skb, int offset, int len);
 void skb_copy_and_csum_dev(const struct sk_buff *skb, u8 *to);
 unsigned int skb_zerocopy_headlen(const struct sk_buff *from);
 int skb_zerocopy(struct sk_buff *to, struct sk_buff *from,
@@ -3252,6 +3277,69 @@ static inline ktime_t net_timedelta(ktime_t t)
 static inline ktime_t net_invalid_timestamp(void)
 {
 	return ktime_set(0, 0);
+}
+
+static inline u8 skb_metadata_len(const struct sk_buff *skb)
+{
+	return skb_shinfo(skb)->meta_len;
+}
+
+static inline void *skb_metadata_end(const struct sk_buff *skb)
+{
+	return skb_mac_header(skb);
+}
+
+static inline bool __skb_metadata_differs(const struct sk_buff *skb_a,
+					  const struct sk_buff *skb_b,
+					  u8 meta_len)
+{
+	const void *a = skb_metadata_end(skb_a);
+	const void *b = skb_metadata_end(skb_b);
+	/* Using more efficient varaiant than plain call to memcmp(). */
+#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) && BITS_PER_LONG == 64
+	u64 diffs = 0;
+
+	switch (meta_len) {
+#define __it(x, op) (x -= sizeof(u##op))
+#define __it_diff(a, b, op) (*(u##op *)__it(a, op)) ^ (*(u##op *)__it(b, op))
+	case 32: diffs |= __it_diff(a, b, 64);
+	case 24: diffs |= __it_diff(a, b, 64);
+	case 16: diffs |= __it_diff(a, b, 64);
+	case  8: diffs |= __it_diff(a, b, 64);
+		break;
+	case 28: diffs |= __it_diff(a, b, 64);
+	case 20: diffs |= __it_diff(a, b, 64);
+	case 12: diffs |= __it_diff(a, b, 64);
+	case  4: diffs |= __it_diff(a, b, 32);
+		break;
+	}
+	return diffs;
+#else
+	return memcmp(a - meta_len, b - meta_len, meta_len);
+#endif
+}
+
+static inline bool skb_metadata_differs(const struct sk_buff *skb_a,
+					const struct sk_buff *skb_b)
+{
+	u8 len_a = skb_metadata_len(skb_a);
+	u8 len_b = skb_metadata_len(skb_b);
+
+	if (!(len_a | len_b))
+		return false;
+
+	return len_a != len_b ?
+	       true : __skb_metadata_differs(skb_a, skb_b, len_a);
+}
+
+static inline void skb_metadata_set(struct sk_buff *skb, u8 meta_len)
+{
+	skb_shinfo(skb)->meta_len = meta_len;
+}
+
+static inline void skb_metadata_clear(struct sk_buff *skb)
+{
+	skb_metadata_set(skb, 0);
 }
 
 struct sk_buff *skb_clone_sk(struct sk_buff *skb);

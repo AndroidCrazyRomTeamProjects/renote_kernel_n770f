@@ -65,7 +65,7 @@
  * .data. We don't want to pull in .data..other sections, which Linux
  * has defined. Same for text and bss.
  */
-#ifdef CONFIG_LD_DEAD_CODE_DATA_ELIMINATION
+#if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG)
 #define TEXT_MAIN .text .text.[0-9a-zA-Z_]*
 #define TEXT_CFI_MAIN .text.cfi .text.[0-9a-zA-Z_]*.cfi
 #define DATA_MAIN .data .data.[0-9a-zA-Z_]*
@@ -171,6 +171,15 @@
 #define TRACE_SYSCALLS()
 #endif
 
+#ifdef CONFIG_BPF_EVENTS
+#define BPF_RAW_TP() STRUCT_ALIGN();					\
+			 VMLINUX_SYMBOL(__start__bpf_raw_tp) = .;	\
+			 KEEP(*(__bpf_raw_tp_map))			\
+			 VMLINUX_SYMBOL(__stop__bpf_raw_tp) = .;
+#else
+#define BPF_RAW_TP()
+#endif
+
 #ifdef CONFIG_SERIAL_EARLYCON
 #define EARLYCON_TABLE() . = ALIGN(8);				\
 			 VMLINUX_SYMBOL(__earlycon_table) = .;	\
@@ -238,6 +247,7 @@
 	LIKELY_PROFILE()		       				\
 	BRANCH_PROFILE()						\
 	TRACE_PRINTKS()							\
+	BPF_RAW_TP()							\
 	TRACEPOINT_STR()
 
 /*
@@ -252,7 +262,8 @@
 
 #define PAGE_ALIGNED_DATA(page_align)					\
 	. = ALIGN(page_align);						\
-	*(.data..page_aligned)
+	*(.data..page_aligned)						\
+	. = ALIGN(page_align);
 
 #define READ_MOSTLY_DATA(align)						\
 	. = ALIGN(align);						\
@@ -288,7 +299,6 @@
 	.rodata           : AT(ADDR(.rodata) - LOAD_OFFSET) {		\
 		VMLINUX_SYMBOL(__start_rodata) = .;			\
 		*(.rodata) *(.rodata.*)					\
-		RO_AFTER_INIT_DATA	/* Read only after init */	\
 		*(__vermagic)		/* Kernel version magic */	\
 		. = ALIGN(8);						\
 		VMLINUX_SYMBOL(__start___tracepoints_ptrs) = .;		\
@@ -299,6 +309,7 @@
 									\
 	.rodata1          : AT(ADDR(.rodata1) - LOAD_OFFSET) {		\
 		*(.rodata1)						\
+		RO_AFTER_INIT_DATA	/* Read only after init */	\
 	}								\
 									\
 	BUG_TABLE							\
@@ -415,8 +426,6 @@
 		KEEP(*(__ksymtab_strings))				\
 	}								\
 									\
-	SECDBG_MEMBERS							\
-									\
 	/* __*init sections */						\
 	__init_rodata : AT(ADDR(__init_rodata) - LOAD_OFFSET) {		\
 		*(.ref.rodata)						\
@@ -463,10 +472,14 @@
  */
 #define TEXT_TEXT							\
 		ALIGN_FUNCTION();					\
-		*(.text.hot TEXT_MAIN .text.fixup .text.unlikely)	\
+		*(.text.hot .text.hot.*)				\
+		*(TEXT_MAIN .text.fixup)				\
+		*(.text.unlikely .text.unlikely.*)			\
+		*(.text.unknown .text.unknown.*)			\
 		*(.text..ftrace)					\
 		*(TEXT_CFI_MAIN) 					\
 		*(.ref.text)						\
+		*(.text.asan.* .text.tsan.*)				\
 	MEM_KEEP(init.text)						\
 	MEM_KEEP(exit.text)						\
 
@@ -623,7 +636,9 @@
 	. = ALIGN(bss_align);						\
 	.bss : AT(ADDR(.bss) - LOAD_OFFSET) {				\
 		BSS_FIRST_SECTIONS					\
+		. = ALIGN(PAGE_SIZE);					\
 		*(.bss..page_aligned)					\
+		. = ALIGN(PAGE_SIZE);					\
 		*(.dynbss)						\
 		*(BSS_MAIN)						\
 		*(COMMON)						\
@@ -681,19 +696,6 @@
 #define BUG_TABLE
 #endif
 
-#ifdef CONFIG_SEC_DEBUG
-#define SECDBG_MEMBERS							\
-	/* Secdbg member table: offsets */				\
-	. = ALIGN(8);							\
-	__secdbg_member_table : AT(ADDR(__secdbg_member_table) - LOAD_OFFSET) { \
-		__start__secdbg_member_table = .;			\
-		KEEP(*(SORT(.secdbg_mbtab.*))) 				\
-		__stop__secdbg_member_table = .;			\
-	}
-#else
-#define SECDBG_MEMBERS
-#endif
-
 #ifdef CONFIG_PM_TRACE
 #define TRACEDATA							\
 	. = ALIGN(4);							\
@@ -734,7 +736,6 @@
 #define DEFERRED_INITCALLS(level)
 #endif
 
-#ifdef CONFIG_DEFERRED_INITCALLS
 #define INIT_CALLS							\
 		VMLINUX_SYMBOL(__initcall_start) = .;			\
 		KEEP(*(.initcallearly.init))				\
@@ -747,23 +748,8 @@
 		INIT_CALLS_LEVEL(rootfs)				\
 		INIT_CALLS_LEVEL(6)					\
 		INIT_CALLS_LEVEL(7)					\
-		VMLINUX_SYMBOL(__initcall_end) = .;		\
+		VMLINUX_SYMBOL(__initcall_end) = .;			\
 		DEFERRED_INITCALLS(0)
-#else
-#define INIT_CALLS							\
-		VMLINUX_SYMBOL(__initcall_start) = .;			\
-		KEEP(*(.initcallearly.init))				\
-		INIT_CALLS_LEVEL(0)					\
-		INIT_CALLS_LEVEL(1)					\
-		INIT_CALLS_LEVEL(2)					\
-		INIT_CALLS_LEVEL(3)					\
-		INIT_CALLS_LEVEL(4)					\
-		INIT_CALLS_LEVEL(5)					\
-		INIT_CALLS_LEVEL(rootfs)				\
-		INIT_CALLS_LEVEL(6)					\
-		INIT_CALLS_LEVEL(7)					\
-		VMLINUX_SYMBOL(__initcall_end) = .;
-#endif
 
 #define CON_INITCALL							\
 		VMLINUX_SYMBOL(__con_initcall_start) = .;		\

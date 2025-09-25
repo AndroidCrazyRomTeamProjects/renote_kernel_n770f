@@ -115,9 +115,9 @@
 #include "udp_impl.h"
 #include <net/sock_reuseport.h>
 #include <net/addrconf.h>
-// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+// KNOX NPA - START
 #include <net/ncm.h>
-// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+// KNOX NPA - END
 
 struct udp_table udp_table __read_mostly;
 EXPORT_SYMBOL(udp_table);
@@ -878,6 +878,7 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 {
 	struct inet_sock *inet = inet_sk(sk);
 	struct udp_sock *up = udp_sk(sk);
+	DECLARE_SOCKADDR(struct sockaddr_in *, usin, msg->msg_name);
 	struct flowi4 fl4_stack;
 	struct flowi4 *fl4;
 	int ulen = len;
@@ -889,7 +890,7 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	__be16 dport;
 	u8  tos;
 	int err, is_udplite = IS_UDPLITE(sk);
-	int corkreq = up->corkflag || msg->msg_flags&MSG_MORE;
+	int corkreq = READ_ONCE(up->corkflag) || msg->msg_flags&MSG_MORE;
 	int (*getfrag)(void *, char *, int, int, int, struct sk_buff *);
 	struct sk_buff *skb;
 	struct ip_options_data opt_copy;
@@ -932,8 +933,7 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	/*
 	 *	Get and verify the address.
 	 */
-	if (msg->msg_name) {
-		DECLARE_SOCKADDR(struct sockaddr_in *, usin, msg->msg_name);
+	if (usin) {
 		if (msg->msg_namelen < sizeof(*usin))
 			return -EINVAL;
 		if (usin->sin_family != AF_INET) {
@@ -981,6 +981,22 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 			ipc.opt = &opt_copy.opt;
 		}
 		rcu_read_unlock();
+	}
+
+	if (cgroup_bpf_enabled && !connected) {
+		err = BPF_CGROUP_RUN_PROG_UDP4_SENDMSG_LOCK(sk,
+					    (struct sockaddr *)usin, &ipc.addr);
+		if (err)
+			goto out_free;
+		if (usin) {
+			if (usin->sin_port == 0) {
+				/* BPF program set invalid port. Reject it. */
+				err = -EINVAL;
+				goto out_free;
+			}
+			daddr = usin->sin_addr.s_addr;
+			dport = usin->sin_port;
+		}
 	}
 
 	saddr = ipc.addr;
@@ -1171,7 +1187,7 @@ int udp_sendpage(struct sock *sk, struct page *page, int offset,
 	}
 
 	up->len += size;
-	if (!(up->corkflag || (flags&MSG_MORE)))
+	if (!(READ_ONCE(up->corkflag) || (flags&MSG_MORE)))
 		ret = udp_push_pending_frames(sk);
 	if (!ret)
 		ret = size;
@@ -1328,6 +1344,10 @@ try_again:
 		sin->sin_addr.s_addr = ip_hdr(skb)->saddr;
 		memset(sin->sin_zero, 0, sizeof(sin->sin_zero));
 		*addr_len = sizeof(*sin);
+
+		if (cgroup_bpf_enabled)
+			BPF_CGROUP_RUN_PROG_UDP4_RECVMSG_LOCK(sk,
+							(struct sockaddr *)sin);
 	}
 	if (inet->cmsg_flags)
 		ip_cmsg_recv_offset(msg, skb, sizeof(struct udphdr), off);
@@ -1352,6 +1372,19 @@ csum_copy_err:
 	msg->msg_flags &= ~MSG_TRUNC;
 	goto try_again;
 }
+
+int udp_pre_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+{
+	/* This check is replicated from __ip4_datagram_connect() and
+	 * intended to prevent BPF program called below from accessing bytes
+	 * that are out of the bound specified by user in addr_len.
+	 */
+	if (addr_len < sizeof(struct sockaddr_in))
+		return -EINVAL;
+
+	return BPF_CGROUP_RUN_PROG_INET4_CONNECT_LOCK(sk, uaddr);
+}
+EXPORT_SYMBOL(udp_pre_connect);
 
 int __udp_disconnect(struct sock *sk, int flags)
 {
@@ -1558,7 +1591,7 @@ int udp_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	/*
 	 * 	UDP-Lite specific tests, ignored on UDP sockets
 	 */
-	if ((is_udplite & UDPLITE_RECV_CC)  &&  UDP_SKB_CB(skb)->partial_cov) {
+	if ((up->pcflag & UDPLITE_RECV_CC)  &&  UDP_SKB_CB(skb)->partial_cov) {
 
 		/*
 		 * MIB statistics other than incrementing the error count are
@@ -1634,7 +1667,7 @@ static void udp_sk_rx_dst_set(struct sock *sk, struct dst_entry *dst)
 	struct dst_entry *old;
 
 	dst_hold(dst);
-	old = xchg(&sk->sk_rx_dst, dst);
+	old = xchg((__force struct dst_entry **)&sk->sk_rx_dst, dst);
 	dst_release(old);
 }
 
@@ -1818,18 +1851,18 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	if (sk) {
 		struct dst_entry *dst = skb_dst(skb);
 		int ret;
-		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+		// KNOX NPA - START
 		struct nf_conn *ct = NULL;
 		enum ip_conntrack_info ctinfo;
 		struct nf_conntrack_tuple *tuple = NULL;
 		char srcaddr[INET6_ADDRSTRLEN_NAP];
 		char dstaddr[INET6_ADDRSTRLEN_NAP];
-		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+		// KNOX NPA - END
 
-		if (unlikely(sk->sk_rx_dst != dst))
+		if (unlikely(rcu_dereference(sk->sk_rx_dst) != dst))
 			udp_sk_rx_dst_set(sk, dst);
 
-		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+		// KNOX NPA - START
 		/* function to handle open flows with incoming udp packets */
 		if (check_ncm_flag()) {
 			if ( (sk) && (sk->sk_protocol == IPPROTO_UDP) ) {
@@ -1876,7 +1909,7 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 				}
 			}
 		}
-		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+		// KNOX NPA - END
 		ret = udp_unicast_rcv_skb(sk, skb, uh);
 		sock_put(sk);
 		return ret;
@@ -1888,14 +1921,14 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 
 	sk = __udp4_lib_lookup_skb(skb, uh->source, uh->dest, udptable);
 	if (sk) {
-		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+		// KNOX NPA - START
 		struct nf_conn *ct = NULL;
 		enum ip_conntrack_info ctinfo;
 		struct nf_conntrack_tuple *tuple = NULL;
 		char srcaddr[INET6_ADDRSTRLEN_NAP];
 		char dstaddr[INET6_ADDRSTRLEN_NAP];
-		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
-		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+		// KNOX NPA - END
+		// KNOX NPA - START
 		/* function to handle open flows with incoming udp packets */
 		if (check_ncm_flag()) {
 			if ( (sk) && (sk->sk_protocol == IPPROTO_UDP) ) {
@@ -1942,7 +1975,7 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 				}
 			}
 		}
-		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+		// KNOX NPA - END
 		/* a return value > 0 means to resubmit the input, but
 		 * it wants the return to be -protocol, or 0
 		 */
@@ -2092,7 +2125,7 @@ void udp_v4_early_demux(struct sk_buff *skb)
 
 	skb->sk = sk;
 	skb->destructor = sock_efree;
-	dst = READ_ONCE(sk->sk_rx_dst);
+	dst = rcu_dereference(sk->sk_rx_dst);
 
 	if (dst)
 		dst = dst_check(dst, 0);
@@ -2116,6 +2149,9 @@ void udp_destroy_sock(struct sock *sk)
 {
 	struct udp_sock *up = udp_sk(sk);
 	bool slow = lock_sock_fast(sk);
+
+	/* protects from races with udp_abort() */
+	sock_set_flag(sk, SOCK_DEAD);
 	udp_flush_pending_frames(sk);
 	unlock_sock_fast(sk, slow);
 	if (static_key_false(&udp_encap_needed) && up->encap_type) {
@@ -2149,9 +2185,9 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
 	switch (optname) {
 	case UDP_CORK:
 		if (val != 0) {
-			up->corkflag = 1;
+			WRITE_ONCE(up->corkflag, 1);
 		} else {
-			up->corkflag = 0;
+			WRITE_ONCE(up->corkflag, 0);
 			lock_sock(sk);
 			push_pending_frames(sk);
 			release_sock(sk);
@@ -2258,7 +2294,7 @@ int udp_lib_getsockopt(struct sock *sk, int level, int optname,
 
 	switch (optname) {
 	case UDP_CORK:
-		val = up->corkflag;
+		val = READ_ONCE(up->corkflag);
 		break;
 
 	case UDP_ENCAP:
@@ -2346,10 +2382,17 @@ int udp_abort(struct sock *sk, int err)
 {
 	lock_sock(sk);
 
+	/* udp{v6}_destroy_sock() sets it under the sk lock, avoid racing
+	 * with close()
+	 */
+	if (sock_flag(sk, SOCK_DEAD))
+		goto out;
+
 	sk->sk_err = err;
 	sk->sk_error_report(sk);
 	__udp_disconnect(sk, 0);
 
+out:
 	release_sock(sk);
 
 	return 0;
@@ -2360,6 +2403,7 @@ struct proto udp_prot = {
 	.name		   = "UDP",
 	.owner		   = THIS_MODULE,
 	.close		   = udp_lib_close,
+	.pre_connect	   = udp_pre_connect,
 	.connect	   = ip4_datagram_connect,
 	.disconnect	   = udp_disconnect,
 	.ioctl		   = udp_ioctl,
@@ -2543,7 +2587,7 @@ int udp4_seq_show(struct seq_file *seq, void *v)
 {
 	seq_setwidth(seq, 127);
 	if (v == SEQ_START_TOKEN)
-		seq_puts(seq, "  sl  local_address rem_address   st tx_queue "
+		seq_puts(seq, "   sl  local_address rem_address   st tx_queue "
 			   "rx_queue tr tm->when retrnsmt   uid  timeout "
 			   "inode ref pointer drops");
 	else {

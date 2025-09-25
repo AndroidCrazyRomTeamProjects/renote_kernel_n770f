@@ -64,6 +64,7 @@
 #include <linux/page_owner.h>
 #include <linux/kthread.h>
 #include <linux/memcontrol.h>
+#include <linux/khugepaged.h>
 #include <linux/psi.h>
 
 #include <asm/sections.h>
@@ -128,6 +129,209 @@ atomic_t rbin_pool_pages = ATOMIC_INIT(0);
 
 int percpu_pagelist_fraction;
 gfp_t gfp_allowed_mask __read_mostly = GFP_BOOT_MASK;
+
+#ifdef CONFIG_PTRACK_DEBUG
+
+#define PTRACK_TABLE_PAGE_ORDERS (8)
+#define PTRACK_TABLE_BYTES (PAGE_SIZE << PTRACK_TABLE_PAGE_ORDERS)
+#define PTRACK_TABLE_ENTRY_NUM (PTRACK_TABLE_BYTES/(sizeof(struct ptrack) * PTRACK_ITEM_NUM))
+#define PTRACK_CEIL(a, b) ((a + b - 1) / b)
+
+static int ptrack_init_on;
+struct ptrack_info ptrack_info;
+static int ptrack_size;
+
+void __init ptrack_init(void)
+{
+	struct memblock_type *type = &memblock.memory;
+	unsigned long i, j;
+
+	ptrack_info.memblockcnt = type->cnt;
+	ptrack_size = sizeof(struct ptrack);
+
+	for (i = 0; i < type->cnt; i++) {
+		unsigned long base, size;
+		unsigned long pagesize;
+		unsigned long tablesize;
+		struct memblock_region *rgn = &type->regions[i];
+
+		struct ptrack **table;
+
+		base = (unsigned long)rgn->base;
+		size = (unsigned long)rgn->size;
+
+		pr_info("%s: base(0x%lx) size(0x%lx)\n", __func__, base, size);
+
+		pagesize = PTRACK_CEIL(size, PAGE_SIZE);
+		tablesize = PTRACK_CEIL(pagesize, PTRACK_TABLE_ENTRY_NUM);
+
+		pr_debug("%s: pagesize(0x%lx) tablesize(0x%lx)\n", __func__, pagesize, tablesize);
+
+		table = kcalloc(tablesize, sizeof(struct ptrack *), GFP_KERNEL);
+		if (table == NULL)
+			goto err;
+
+		ptrack_info.tables[i]  = table;
+		ptrack_info.tables_size[i] = tablesize;
+
+		for (j = 0; j < tablesize; j++) {
+			struct page *p;
+
+			p = alloc_pages(GFP_KERNEL | __GFP_ZERO, PTRACK_TABLE_PAGE_ORDERS);
+			if (!p)
+				goto err;
+
+			table[j] = (struct ptrack *)page_address(p);
+			if (!table[j])
+				goto err;
+		}
+
+		pr_info("%s: memblock%lu - ptrack %luMB\n", __func__, i, tablesize);
+	}
+
+	ptrack_init_on = 1;
+	return;
+
+err:
+	for (i = 0; i < type->cnt; i++) {
+		if (ptrack_info.tables[i] != NULL) {
+			struct page *p;
+			struct ptrack **table = ptrack_info.tables[i];
+
+			for (j = 0; j < ptrack_info.tables_size[i]; j++) {
+				if (table[j] != NULL) {
+					p = virt_to_page(table[j]);
+					__free_pages(p, PTRACK_TABLE_PAGE_ORDERS);
+				}
+			}
+
+			kfree(ptrack_info.tables[i]);
+		}
+
+		ptrack_info.tables[i] = NULL;
+	}
+
+	pr_err("%s: ptrack error\n", __func__);
+}
+
+static int ptrack_check_target(struct page *page)
+{
+	if (!page)
+		return 0;
+
+	return 1;
+}
+
+static struct ptrack *_ptrack_alloc(struct page *page)
+{
+	struct memblock_type *type = &memblock.memory;
+	unsigned long base;
+	unsigned long page_address;
+	unsigned long i;
+
+	if (!ptrack_init_on || page->ptrack)
+		return NULL;
+
+	page_address = page_to_phys(page);
+
+	for (i = 0; i < type->cnt; i++) {
+		struct memblock_region *rgn = &type->regions[i];
+
+		if (page_address >= rgn->base && page_address < rgn->base + rgn->size) {
+			int index;
+			int table_index;
+			int table_offset;
+			struct ptrack **table = ptrack_info.tables[i];
+
+			base = rgn->base;
+			index = (page_address - base) / PAGE_SIZE;
+			table_index = index / PTRACK_TABLE_ENTRY_NUM;
+			table_offset = (index % PTRACK_TABLE_ENTRY_NUM) * PTRACK_ITEM_NUM;
+
+			page->ptrack = &table[table_index][table_offset];
+
+			memset(page->ptrack, 0x00, sizeof(struct ptrack) * PTRACK_ITEM_NUM);
+
+			return page->ptrack;
+		}
+	}
+
+	return NULL;
+}
+
+static struct ptrack *ptrack_get(struct page *page, enum ptrack_item alloc)
+{
+	struct ptrack *p;
+	int curr;
+
+	p = page->ptrack;
+
+	if (!p)
+		return NULL;
+
+	curr = alloc;
+
+	return p + curr;
+}
+
+static void _ptrack_set(struct ptrack *p, unsigned long addr)
+{
+#ifdef CONFIG_STACKTRACE
+	struct stack_trace trace;
+	int i;
+
+	trace.nr_entries = 0;
+	trace.max_entries = PTRACK_ADDRS_COUNT;
+	trace.entries = p->addrs;
+	trace.skip = 3;
+	save_stack_trace(&trace);
+
+	/* See rant in lockdep.c */
+	if (trace.nr_entries != 0 &&
+	    trace.entries[trace.nr_entries - 1] == ULONG_MAX)
+		trace.nr_entries--;
+
+	for (i = trace.nr_entries; i < PTRACK_ADDRS_COUNT; i++)
+		p->addrs[i] = 0;
+#endif
+	p->addr = addr;
+	preempt_disable();
+	p->cpu = smp_processor_id();
+	preempt_enable();
+	p->pid = current->pid;
+	p->when = cpu_clock(0);
+}
+
+static void ptrack_set(struct page *page,
+			enum ptrack_item alloc, unsigned long addr)
+{
+	struct ptrack *p = ptrack_get(page, alloc);
+
+	if (!p)
+		p = _ptrack_alloc(page);
+
+	if (!p)
+		return;
+
+	if (addr) {
+		p = ptrack_get(page, alloc);
+		_ptrack_set(p, addr);
+	}
+}
+#endif
+
+static unsigned int boot_mode;
+static int __init setup_bootmode(char *str)
+{
+	pr_info("%s: boot_mode is %u\n", __func__, boot_mode);
+	if (get_option(&str, &boot_mode)) {
+		pr_info("%s: boot_mode is %u\n", __func__, boot_mode);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+early_param("bootmode", setup_bootmode);
 
 #ifdef CONFIG_PM_SLEEP
 /*
@@ -256,7 +460,7 @@ int watermark_scale_factor = 10;
  * free memory, to make space for new workloads. Anyone can allocate
  * down to the min watermarks controlled by min_free_kbytes above.
  */
-int extra_free_kbytes = 0;
+int extra_free_kbytes;
 
 static unsigned long __meminitdata nr_kernel_pages;
 static unsigned long __meminitdata nr_all_pages;
@@ -814,7 +1018,7 @@ static inline void __free_one_page(struct page *page,
 	struct page *buddy;
 	unsigned int max_order;
 
-	max_order = min_t(unsigned int, MAX_ORDER, pageblock_order + 1);
+	max_order = min_t(unsigned int, MAX_ORDER - 1, pageblock_order);
 
 	VM_BUG_ON(!zone_is_initialized(zone));
 	VM_BUG_ON_PAGE(page->flags & PAGE_FLAGS_CHECK_AT_PREP, page);
@@ -829,7 +1033,7 @@ static inline void __free_one_page(struct page *page,
 	VM_BUG_ON_PAGE(bad_range(zone, page), page);
 
 continue_merging:
-	while (order < max_order - 1) {
+	while (order < max_order) {
 		buddy_idx = __find_buddy_index(page_idx, order);
 		buddy = page + (buddy_idx - page_idx);
 		if (!page_is_buddy(page, buddy, order))
@@ -850,7 +1054,7 @@ continue_merging:
 		page_idx = combined_idx;
 		order++;
 	}
-	if (max_order < MAX_ORDER) {
+	if (order < MAX_ORDER - 1) {
 		/* If we are here, it means order is >= pageblock_order.
 		 * We want to prevent merge between freepages on isolate
 		 * pageblock and normal pageblock. Without this, pageblock
@@ -871,7 +1075,7 @@ continue_merging:
 						is_migrate_isolate(buddy_mt)))
 				goto done_merging;
 		}
-		max_order++;
+		max_order = order + 1;
 		goto continue_merging;
 	}
 
@@ -1015,6 +1219,9 @@ static __always_inline bool free_pages_prepare(struct page *page,
 					unsigned int order, bool check_free)
 {
 	int bad = 0;
+#ifdef CONFIG_PTRACK_DEBUG
+	int i, page_num;
+#endif
 
 	VM_BUG_ON_PAGE(PageTail(page), page);
 
@@ -1067,6 +1274,14 @@ static __always_inline bool free_pages_prepare(struct page *page,
 	kernel_map_pages(page, 1 << order, 0);
 	kasan_free_pages(page, order);
 
+#ifdef CONFIG_PTRACK_DEBUG
+	if (ptrack_check_target(page)) {
+		page_num = 1 << order;
+		for (i = 0; i < page_num; i++)
+			ptrack_set(&page[i], PTRACK_FREE, _RET_IP_);
+	}
+#endif
+
 	return true;
 }
 
@@ -1117,6 +1332,11 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 	if (nr_scanned)
 		__mod_node_page_state(zone->zone_pgdat, NR_PAGES_SCANNED, -nr_scanned);
 
+	/*
+	 * Ensure proper count is passed which otherwise would stuck in the
+	 * below while (list_empty(list)) loop.
+	 */
+	count = min(pcp->count, count);
 	while (count) {
 		struct page *page;
 		struct list_head *list;
@@ -1409,6 +1629,7 @@ void set_zone_contiguous(struct zone *zone)
 		if (!__pageblock_pfn_to_page(block_start_pfn,
 					     block_end_pfn, zone))
 			return;
+		cond_resched();
 	}
 
 	/* We confirm that there is no hole */
@@ -3433,7 +3654,8 @@ retry:
 	 */
 	if (!page && !drained) {
 		unreserve_highatomic_pageblock(ac);
-		drain_all_pages(NULL);
+		if (!need_memory_boosting(NULL))
+			drain_all_pages(NULL);
 		drained = true;
 		goto retry;
 	}
@@ -3621,18 +3843,12 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	bool can_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;
 	struct page *page = NULL;
 	unsigned int alloc_flags;
-	unsigned long did_some_progress = 0;
+	unsigned long did_some_progress;
 	enum compact_priority compact_priority;
 	enum compact_result compact_result;
 	int compaction_retries;
 	int no_progress_loops;
 	unsigned int cpuset_mems_cookie;
-	unsigned long pages_reclaimed = 0;
-	int retry_loop_count = 0;
-	unsigned long jiffies_s = jiffies;
-	cputime_t stime_s = 0, stime_e, stime_d;
-
-	task_cputime(current, NULL, &stime_s);
 
 	/*
 	 * In the slowpath, we sanity check order to avoid ever trying to
@@ -3731,7 +3947,6 @@ retry_cpuset:
 	}
 
 retry:
-	retry_loop_count++;
 	/* Ensure kswapd doesn't accidentally go to sleep as long as we loop */
 	if (gfp_mask & __GFP_KSWAPD_RECLAIM)
 		wake_all_kswapds(order, ac);
@@ -3787,7 +4002,6 @@ retry:
 	/* Try direct reclaim and then allocating */
 	page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
 							&did_some_progress);
-	pages_reclaimed += did_some_progress;
 	if (page)
 		goto got_pg;
 
@@ -3856,29 +4070,6 @@ nopage:
 	warn_alloc(gfp_mask,
 			"page allocation failure: order:%u", order);
 got_pg:
-	task_cputime(current, NULL, &stime_e);
-	stime_d = stime_e - stime_s;
-	if (cputime_to_jiffies(stime_d) > HZ / 4) {
-		pg_data_t *pgdat;
-
-		unsigned long a_anon = 0;
-		unsigned long in_anon = 0;
-		unsigned long a_file = 0;
-		unsigned long in_file = 0;
-		for_each_online_pgdat(pgdat) {
-			a_anon += node_page_state(pgdat, NR_ACTIVE_ANON);
-			in_anon += node_page_state(pgdat, NR_INACTIVE_ANON);
-			a_file += node_page_state(pgdat, NR_ACTIVE_FILE);
-			in_file += node_page_state(pgdat, NR_INACTIVE_FILE);
-		}
-		pr_info("alloc stall: timeJS(ms):%u|%u rec:%lu|%lu ret:%d o:%d gfp:%#x(%pGg) AaiFai:%lukB|%lukB|%lukB|%lukB\n",
-			jiffies_to_msecs(jiffies - jiffies_s),
-			jiffies_to_msecs(cputime_to_jiffies(stime_d)),
-			did_some_progress, pages_reclaimed, retry_loop_count,
-			order, gfp_mask, &gfp_mask,
-			a_anon << (PAGE_SHIFT-10), in_anon << (PAGE_SHIFT-10),
-			a_file << (PAGE_SHIFT-10), in_file << (PAGE_SHIFT-10));
-	}
 	clear_tsk_thread_flag(current, TIF_MEMALLOC);
 	return page;
 }
@@ -3899,6 +4090,10 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order,
 		.nodemask = nodemask,
 		.migratetype = gfpflags_to_migratetype(gfp_mask),
 	};
+
+#ifdef CONFIG_PTRACK_DEBUG
+	int i, page_num;
+#endif
 
 	if (cpusets_enabled()) {
 		alloc_mask |= __GFP_HARDWALL;
@@ -3990,6 +4185,14 @@ out:
 
 	trace_mm_page_alloc(page, order, alloc_mask, ac.migratetype);
 
+#ifdef CONFIG_PTRACK_DEBUG
+	if (ptrack_check_target(page)) {
+		page_num = 1 << order;
+		for (i = 0; i < page_num; i++)
+			ptrack_set(&page[i], PTRACK_ALLOC, _RET_IP_);
+	}
+#endif
+
 	return page;
 }
 EXPORT_SYMBOL(__alloc_pages_nodemask);
@@ -4074,8 +4277,8 @@ static struct page *__page_frag_refill(struct page_frag_cache *nc,
 	return page;
 }
 
-void *__alloc_page_frag(struct page_frag_cache *nc,
-			unsigned int fragsz, gfp_t gfp_mask)
+void *page_frag_alloc(struct page_frag_cache *nc,
+		      unsigned int fragsz, gfp_t gfp_mask)
 {
 	unsigned int size = PAGE_SIZE;
 	struct page *page;
@@ -4094,11 +4297,11 @@ refill:
 		/* Even if we own the page, we do not use atomic_set().
 		 * This would break get_page_unless_zero() users.
 		 */
-		page_ref_add(page, size);
+		page_ref_add(page, PAGE_FRAG_CACHE_MAX_SIZE);
 
 		/* reset page count bias and offset to start of new frag */
 		nc->pfmemalloc = page_is_pfmemalloc(page);
-		nc->pagecnt_bias = size + 1;
+		nc->pagecnt_bias = PAGE_FRAG_CACHE_MAX_SIZE + 1;
 		nc->offset = size;
 	}
 
@@ -4114,11 +4317,23 @@ refill:
 		size = nc->size;
 #endif
 		/* OK, page count is 0, we can safely set it */
-		set_page_count(page, size + 1);
+		set_page_count(page, PAGE_FRAG_CACHE_MAX_SIZE + 1);
 
 		/* reset page count bias and offset to start of new frag */
-		nc->pagecnt_bias = size + 1;
+		nc->pagecnt_bias = PAGE_FRAG_CACHE_MAX_SIZE + 1;
 		offset = size - fragsz;
+		if (unlikely(offset < 0)) {
+			/*
+			 * The caller is trying to allocate a fragment
+			 * with fragsz > PAGE_SIZE but the cache isn't big
+			 * enough to satisfy the request, this may
+			 * happen in low memory conditions.
+			 * We don't release the cache page because
+			 * it could make memory pressure worse
+			 * so we simply return NULL here.
+			 */
+			return NULL;
+		}
 	}
 
 	nc->pagecnt_bias--;
@@ -4126,19 +4341,19 @@ refill:
 
 	return nc->va + offset;
 }
-EXPORT_SYMBOL(__alloc_page_frag);
+EXPORT_SYMBOL(page_frag_alloc);
 
 /*
  * Frees a page fragment allocated out of either a compound or order 0 page.
  */
-void __free_page_frag(void *addr)
+void page_frag_free(void *addr)
 {
 	struct page *page = virt_to_head_page(addr);
 
 	if (unlikely(put_page_testzero(page)))
 		__free_pages_ok(page, compound_order(page));
 }
-EXPORT_SYMBOL(__free_page_frag);
+EXPORT_SYMBOL(page_frag_free);
 
 static void *make_alloc_exact(unsigned long addr, unsigned int order,
 		size_t size)
@@ -4309,8 +4524,8 @@ long si_mem_available(void)
 	 * Part of the reclaimable slab consists of items that are in use,
 	 * and cannot be freed. Cap this estimate at the low watermark.
 	 */
-	available += global_page_state(NR_SLAB_RECLAIMABLE) -
-		     min(global_page_state(NR_SLAB_RECLAIMABLE) / 2, wmark_low);
+	available += global_node_page_state(NR_SLAB_RECLAIMABLE) -
+		     min(global_node_page_state(NR_SLAB_RECLAIMABLE) / 2, wmark_low);
 
 	if (available < 0)
 		available = 0;
@@ -4456,8 +4671,8 @@ void show_free_areas(unsigned int filter)
 		global_node_page_state(NR_FILE_DIRTY),
 		global_node_page_state(NR_WRITEBACK),
 		global_node_page_state(NR_UNSTABLE_NFS),
-		global_page_state(NR_SLAB_RECLAIMABLE),
-		global_page_state(NR_SLAB_UNRECLAIMABLE),
+		global_node_page_state(NR_SLAB_RECLAIMABLE),
+		global_node_page_state(NR_SLAB_UNRECLAIMABLE),
 		global_node_page_state(NR_FILE_MAPPED),
 		global_node_page_state(NR_SHMEM),
 		global_page_state(NR_PAGETABLE),
@@ -4565,8 +4780,8 @@ void show_free_areas(unsigned int filter)
 			K(zone->present_pages),
 			K(zone->managed_pages),
 			K(zone_page_state(zone, NR_MLOCK)),
-			K(zone_page_state(zone, NR_SLAB_RECLAIMABLE)),
-			K(zone_page_state(zone, NR_SLAB_UNRECLAIMABLE)),
+			K(node_page_state(zone, NR_SLAB_RECLAIMABLE)),
+			K(node_page_state(zone, NR_SLAB_UNRECLAIMABLE)),
 			zone_page_state(zone, NR_KERNEL_STACK_KB),
 			K(zone_page_state(zone, NR_PAGETABLE)),
 			K(zone_page_state(zone, NR_BOUNCE)),
@@ -4641,7 +4856,7 @@ static int build_zonelists_node(pg_data_t *pgdat, struct zonelist *zonelist,
 	do {
 		zone_type--;
 		zone = pgdat->node_zones + zone_type;
-		if (managed_zone(zone)) {
+		if (populated_zone(zone)) {
 			zoneref_set_zone(zone,
 				&zonelist->_zonerefs[nr_zones++]);
 			check_highest_zone(zone_type);
@@ -4752,7 +4967,7 @@ int numa_zonelist_order_handler(struct ctl_table *table, int write,
 			user_zonelist_order = oldval;
 		} else if (oldval != user_zonelist_order) {
 			mutex_lock(&zonelists_mutex);
-			build_all_zonelists(NULL, NULL);
+			build_all_zonelists(NULL, NULL, false);
 			mutex_unlock(&zonelists_mutex);
 		}
 	}
@@ -5132,11 +5347,12 @@ build_all_zonelists_init(void)
  * (2) call of __init annotated helper build_all_zonelists_init
  * [protected by SYSTEM_BOOTING].
  */
-void __ref build_all_zonelists(pg_data_t *pgdat, struct zone *zone)
+void __ref build_all_zonelists(pg_data_t *pgdat, struct zone *zone,
+			       bool hotplug_context)
 {
 	set_zonelist_order();
 
-	if (system_state == SYSTEM_BOOTING) {
+	if (system_state == SYSTEM_BOOTING && !hotplug_context) {
 		build_all_zonelists_init();
 	} else {
 #ifdef CONFIG_MEMORY_HOTPLUG
@@ -5280,13 +5496,12 @@ static int zone_batchsize(struct zone *zone)
 
 	/*
 	 * The per-cpu-pages pools are set to around 1000th of the
-	 * size of the zone.  But no more than 1/2 of a meg.
-	 *
-	 * OK, so we don't know how big the cache is.  So guess.
+	 * size of the zone.
 	 */
 	batch = zone->managed_pages / 1024;
-	if (batch * PAGE_SIZE > 512 * 1024)
-		batch = (512 * 1024) / PAGE_SIZE;
+	/* But no more than a meg. */
+	if (batch * PAGE_SIZE > 1024 * 1024)
+		batch = (1024 * 1024) / PAGE_SIZE;
 	batch /= 4;		/* We effectively *= 4 below */
 	if (batch < 1)
 		batch = 1;
@@ -6404,9 +6619,16 @@ restart:
 
 out2:
 	/* Align start of ZONE_MOVABLE on all nids to MAX_ORDER_NR_PAGES */
-	for (nid = 0; nid < MAX_NUMNODES; nid++)
+	for (nid = 0; nid < MAX_NUMNODES; nid++) {
+		unsigned long start_pfn, end_pfn;
+
 		zone_movable_pfn[nid] =
 			roundup(zone_movable_pfn[nid], MAX_ORDER_NR_PAGES);
+
+		get_pfn_range_for_nid(nid, &start_pfn, &end_pfn);
+		if (zone_movable_pfn[nid] >= end_pfn)
+			zone_movable_pfn[nid] = 0;
+	}
 
 out:
 	/* restore the node_state */
@@ -6635,7 +6857,7 @@ void __init mem_init_print_info(const char *str)
 	 */
 #define adj_init_size(start, end, size, pos, adj) \
 	do { \
-		if (start <= pos && pos < end && size > adj) \
+		if (&start[0] <= &pos[0] && &pos[0] < &end[0] && size > adj) \
 			size -= adj; \
 	} while (0)
 
@@ -6930,9 +7152,11 @@ int __meminit init_per_zone_wmark_min(void)
 	setup_min_slab_ratio();
 #endif
 
+	khugepaged_min_free_kbytes_update();
+
 	return 0;
 }
-core_initcall(init_per_zone_wmark_min)
+postcore_initcall(init_per_zone_wmark_min)
 
 /*
  * min_free_kbytes_sysctl_handler - just a wrapper around proc_dointvec() so

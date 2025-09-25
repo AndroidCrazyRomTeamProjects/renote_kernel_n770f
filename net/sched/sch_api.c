@@ -393,7 +393,8 @@ struct qdisc_rate_table *qdisc_get_rtab(struct tc_ratespec *r,
 {
 	struct qdisc_rate_table *rtab;
 
-	if (tab == NULL || r->rate == 0 || r->cell_log == 0 ||
+	if (tab == NULL || r->rate == 0 ||
+	    r->cell_log == 0 || r->cell_log >= 32 ||
 	    nla_len(tab) != TC_RTAB_SIZE)
 		return NULL;
 
@@ -1181,6 +1182,35 @@ static int tc_get_qdisc(struct sk_buff *skb, struct nlmsghdr *n)
 }
 
 /*
+ * enable/disable flow on qdisc.
+ */
+void
+tc_qdisc_flow_control(struct net_device *dev, u32 tcm_handle, int enable_flow)
+{
+	struct Qdisc *q;
+	struct __qdisc_change_req {
+		struct nlattr attr;
+		struct tc_prio_qopt data;
+	} req =	{
+		.attr = {sizeof(struct __qdisc_change_req), TCA_OPTIONS},
+		.data = {3, {1, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1}, 1}
+		};
+
+	/* override flow bit */
+	req.data.enable_flow = enable_flow;
+
+	/* look up using tcm handle */
+	q = qdisc_lookup(dev, tcm_handle);
+
+	/* call registered change function */
+	if (q) {
+		if (q->ops->change(q, &req.attr) != 0)
+			pr_err("qdisc_flow_control: qdisc change failed");
+	}
+}
+EXPORT_SYMBOL(tc_qdisc_flow_control);
+
+/*
  * Create/change qdisc.
  */
 
@@ -1788,7 +1818,7 @@ static int tc_dump_tclass_qdisc(struct Qdisc *q, struct sk_buff *skb,
 
 static int tc_dump_tclass_root(struct Qdisc *root, struct sk_buff *skb,
 			       struct tcmsg *tcm, struct netlink_callback *cb,
-			       int *t_p, int s_t)
+			       int *t_p, int s_t, bool recur)
 {
 	struct Qdisc *q;
 	int b;
@@ -1799,7 +1829,7 @@ static int tc_dump_tclass_root(struct Qdisc *root, struct sk_buff *skb,
 	if (tc_dump_tclass_qdisc(root, skb, tcm, cb, t_p, s_t) < 0)
 		return -1;
 
-	if (!qdisc_dev(root))
+	if (!qdisc_dev(root) || !recur)
 		return 0;
 
 	hash_for_each(qdisc_dev(root)->qdisc_hash, b, q, hash) {
@@ -1827,13 +1857,13 @@ static int tc_dump_tclass(struct sk_buff *skb, struct netlink_callback *cb)
 	s_t = cb->args[0];
 	t = 0;
 
-	if (tc_dump_tclass_root(dev->qdisc, skb, tcm, cb, &t, s_t) < 0)
+	if (tc_dump_tclass_root(dev->qdisc, skb, tcm, cb, &t, s_t, true) < 0)
 		goto done;
 
 	dev_queue = dev_ingress_queue(dev);
 	if (dev_queue &&
 	    tc_dump_tclass_root(dev_queue->qdisc_sleeping, skb, tcm, cb,
-				&t, s_t) < 0)
+				&t, s_t, false) < 0)
 		goto done;
 
 done:

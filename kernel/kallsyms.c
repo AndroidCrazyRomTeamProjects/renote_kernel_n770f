@@ -550,14 +550,17 @@ struct kallsym_iter {
 	char type;
 	char name[KSYM_NAME_LEN];
 	char module_name[MODULE_NAME_LEN];
+	int show_value;
 	int exported;
 };
 
 static int get_ksymbol_mod(struct kallsym_iter *iter)
+unsigned long value;
 {
 	if (module_get_kallsym(iter->pos - kallsyms_num_syms, &iter->value,
 				&iter->type, iter->name, iter->module_name,
 				&iter->exported) < 0)
+				value = iter->show_value ? iter->value : 0;
 		return 0;
 	return 1;
 }

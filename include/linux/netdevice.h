@@ -65,6 +65,7 @@ struct mpls_dev;
 /* UDP Tunnel offloads */
 struct udp_tunnel_info;
 struct bpf_prog;
+struct xdp_buff;
 
 void netdev_set_default_ethtool_ops(struct net_device *dev,
 				    const struct ethtool_ops *ops);
@@ -808,7 +809,7 @@ struct tc_to_netdev {
 /* These structures hold the attributes of xdp state that are being passed
  * to the netdevice through the xdp op.
  */
-enum xdp_netdev_command {
+enum bpf_netdev_command {
 	/* Set or clear a bpf program used in the earliest stages of packet
 	 * rx. The prog will have been loaded as BPF_PROG_TYPE_XDP. The callee
 	 * is responsible for calling bpf_prog_put on any old progs that are
@@ -821,15 +822,30 @@ enum xdp_netdev_command {
 	 * return true if a program is currently attached and running.
 	 */
 	XDP_QUERY_PROG,
+	/* BPF program for offload callbacks, invoked at program load time. */
+	BPF_OFFLOAD_VERIFIER_PREP,
+	BPF_OFFLOAD_TRANSLATE,
+	BPF_OFFLOAD_DESTROY,
 };
 
-struct netdev_xdp {
-	enum xdp_netdev_command command;
+struct bpf_prog_offload_ops;
+
+struct netdev_bpf {
+	enum bpf_netdev_command command;
 	union {
 		/* XDP_SETUP_PROG */
 		struct bpf_prog *prog;
 		/* XDP_QUERY_PROG */
 		bool prog_attached;
+		/* BPF_OFFLOAD_VERIFIER_PREP */
+		struct {
+			struct bpf_prog *prog;
+			const struct bpf_prog_offload_ops *ops; /* callee set */
+		} verifier;
+		/* BPF_OFFLOAD_TRANSLATE, BPF_OFFLOAD_DESTROY */
+		struct {
+			struct bpf_prog *prog;
+		} offload;
 	};
 };
 
@@ -1130,10 +1146,16 @@ struct netdev_xdp {
  *	appropriate rx headroom value allows avoiding skb head copy on
  *	forward. Setting a negative value resets the rx headroom to the
  *	default value.
- * int (*ndo_xdp)(struct net_device *dev, struct netdev_xdp *xdp);
+ * int (*ndo_bpf)(struct net_device *dev, struct netdev_bpf *bpf);
  *	This function is used to set or query state related to XDP on the
- *	netdevice. See definition of enum xdp_netdev_command for details.
- *
+ *	netdevice and manage BPF offload. See definition of
+ *	enum bpf_netdev_command for details.
+ * int (*ndo_xdp_xmit)(struct net_device *dev, struct xdp_buff *xdp);
+ *	This function is used to submit a XDP packet for transmit on a
+ *	netdevice.
+ * void (*ndo_xdp_flush)(struct net_device *dev);
+ *	This function is used to inform the driver to flush a paticular
+ *	xpd tx queue. Must be called on same CPU as xdp_xmit.
  */
 struct net_device_ops {
 	int			(*ndo_init)(struct net_device *dev);
@@ -1322,8 +1344,11 @@ struct net_device_ops {
 						       struct sk_buff *skb);
 	void			(*ndo_set_rx_headroom)(struct net_device *dev,
 						       int needed_headroom);
-	int			(*ndo_xdp)(struct net_device *dev,
-					   struct netdev_xdp *xdp);
+	int			(*ndo_bpf)(struct net_device *dev,
+					   struct netdev_bpf *bpf);
+	int			(*ndo_xdp_xmit)(struct net_device *dev,
+						struct xdp_buff *xdp);
+	void			(*ndo_xdp_flush)(struct net_device *dev);
 };
 
 /**
@@ -1730,6 +1755,11 @@ struct net_device {
 	unsigned char		if_port;
 	unsigned char		dma;
 
+	/* Note : dev->mtu is often read without holding a lock.
+	 * Writers usually hold RTNL.
+	 * It is recommended to use READ_ONCE() to annotate the reads,
+	 * and to use WRITE_ONCE() to annotate the writes.
+	 */
 	unsigned int		mtu;
 	unsigned short		type;
 	unsigned short		hard_header_len;
@@ -1907,6 +1937,9 @@ struct net_device {
 	struct lock_class_key	*qdisc_tx_busylock;
 	struct lock_class_key	*qdisc_running_key;
 	bool			proto_down;
+#ifdef CONFIG_NETPM
+	bool netpm_use;
+#endif
 };
 #define to_net_dev(d) container_of(d, struct net_device, dev)
 
@@ -2232,6 +2265,7 @@ struct packet_type {
 					 struct net_device *);
 	bool			(*id_match)(struct packet_type *ptype,
 					    struct sock *sk);
+	struct net		*af_packet_net;
 	void			*af_packet_priv;
 	struct list_head	list;
 };
@@ -2475,7 +2509,7 @@ void synchronize_net(void);
 int init_dummy_netdev(struct net_device *dev);
 
 DECLARE_PER_CPU(int, xmit_recursion);
-#define XMIT_RECURSION_LIMIT	10
+#define XMIT_RECURSION_LIMIT	8
 
 static inline int dev_recursion_level(void)
 {
@@ -2867,9 +2901,7 @@ struct softnet_data {
 	struct sk_buff_head	input_pkt_queue;
 	struct napi_struct	backlog;
 
-#ifdef CONFIG_MODEM_IF_NET_GRO
 	struct napi_struct	*current_napi;
-#endif
 };
 
 static inline void input_queue_head_incr(struct softnet_data *sd)
@@ -3335,10 +3367,7 @@ struct sk_buff *napi_get_frags(struct napi_struct *napi);
 gro_result_t napi_gro_frags(struct napi_struct *napi);
 struct packet_offload *gro_find_receive_by_type(__be16 type);
 struct packet_offload *gro_find_complete_by_type(__be16 type);
-
-#ifdef CONFIG_SEC_SIPC_MODEM_IF
 struct napi_struct *napi_get_current(void);
-#endif
 
 static inline void napi_free_frags(struct napi_struct *napi)
 {
@@ -3411,7 +3440,8 @@ void netdev_run_todo(void);
  */
 static inline void dev_put(struct net_device *dev)
 {
-	this_cpu_dec(*dev->pcpu_refcnt);
+	if (dev)
+		this_cpu_dec(*dev->pcpu_refcnt);
 }
 
 /**
@@ -3422,7 +3452,8 @@ static inline void dev_put(struct net_device *dev)
  */
 static inline void dev_hold(struct net_device *dev)
 {
-	this_cpu_inc(*dev->pcpu_refcnt);
+	if (dev)
+		this_cpu_inc(*dev->pcpu_refcnt);
 }
 
 /* Carrier loss detection, dial on demand. The functions netif_carrier_on
@@ -3572,7 +3603,7 @@ static inline u32 netif_msg_init(int debug_value, int default_msg_enable_bits)
 	if (debug_value == 0)	/* no output */
 		return 0;
 	/* set low N bits */
-	return (1 << debug_value) - 1;
+	return (1U << debug_value) - 1;
 }
 
 static inline void __netif_tx_lock(struct netdev_queue *txq, int cpu)
@@ -3703,6 +3734,7 @@ static inline void netif_tx_disable(struct net_device *dev)
 
 	local_bh_disable();
 	cpu = smp_processor_id();
+	spin_lock(&dev->tx_global_lock);
 	for (i = 0; i < dev->num_tx_queues; i++) {
 		struct netdev_queue *txq = netdev_get_tx_queue(dev, i);
 
@@ -3710,6 +3742,7 @@ static inline void netif_tx_disable(struct net_device *dev)
 		netif_tx_stop_queue(txq);
 		__netif_tx_unlock(txq);
 	}
+	spin_unlock(&dev->tx_global_lock);
 	local_bh_enable();
 }
 

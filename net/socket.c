@@ -498,7 +498,7 @@ static struct socket *sockfd_lookup_light(int fd, int *err, int *fput_needed)
 	if (f.file) {
 		sock = sock_from_file(f.file, err);
 		if (likely(sock)) {
-			*fput_needed = f.flags;
+			*fput_needed = f.flags & FDPUT_FPUT;
 			return sock;
 		}
 		fdput(f);
@@ -667,6 +667,20 @@ int kernel_sendmsg(struct socket *sock, struct msghdr *msg,
 	return sock_sendmsg(sock, msg);
 }
 EXPORT_SYMBOL(kernel_sendmsg);
+
+int kernel_sendmsg_locked(struct sock *sk, struct msghdr *msg,
+			  struct kvec *vec, size_t num, size_t size)
+{
+	struct socket *sock = sk->sk_socket;
+
+	if (!sock->ops->sendmsg_locked)
+		sock_no_sendmsg_locked(sk, msg, size);
+
+	iov_iter_kvec(&msg->msg_iter, WRITE | ITER_KVEC, vec, num, size);
+
+	return sock->ops->sendmsg_locked(sk, msg, msg_data_left(msg));
+}
+EXPORT_SYMBOL(kernel_sendmsg_locked);
 
 /*
  * called from sock_recv_timestamp() if sock_flag(sk, SOCK_RCVTSTAMP)
@@ -1430,7 +1444,7 @@ SYSCALL_DEFINE2(listen, int, fd, int, backlog)
 
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (sock) {
-		somaxconn = sock_net(sock->sk)->core.sysctl_somaxconn;
+		somaxconn = READ_ONCE(sock_net(sock->sk)->core.sysctl_somaxconn);
 		if ((unsigned int)backlog > somaxconn)
 			backlog = somaxconn;
 
@@ -1762,8 +1776,8 @@ SYSCALL_DEFINE4(recv, int, fd, void __user *, ubuf, size_t, size,
  *	to pass the user mode parameter for the protocols to sort out.
  */
 
-SYSCALL_DEFINE5(setsockopt, int, fd, int, level, int, optname,
-		char __user *, optval, int, optlen)
+static int __sys_setsockopt(int fd, int level, int optname,
+			    char __user *optval, int optlen)
 {
 	int err, fput_needed;
 	struct socket *sock;
@@ -1791,13 +1805,19 @@ out_put:
 	return err;
 }
 
+SYSCALL_DEFINE5(setsockopt, int, fd, int, level, int, optname,
+		char __user *, optval, int, optlen)
+{
+	return __sys_setsockopt(fd, level, optname, optval, optlen);
+}
+
 /*
  *	Get a socket option. Because we don't know the option lengths we have
  *	to pass a user mode parameter for the protocols to sort out.
  */
 
-SYSCALL_DEFINE5(getsockopt, int, fd, int, level, int, optname,
-		char __user *, optval, int __user *, optlen)
+static int __sys_getsockopt(int fd, int level, int optname,
+			    char __user *optval, int __user *optlen)
 {
 	int err, fput_needed;
 	struct socket *sock;
@@ -1820,6 +1840,12 @@ out_put:
 		fput_light(sock->file, fput_needed);
 	}
 	return err;
+}
+
+SYSCALL_DEFINE5(getsockopt, int, fd, int, level, int, optname,
+		char __user *, optval, int __user *, optlen)
+{
+	return __sys_getsockopt(fd, level, optname, optval, optlen);
 }
 
 /*
@@ -2432,12 +2458,13 @@ SYSCALL_DEFINE2(socketcall, int, call, unsigned long __user *, args)
 		err = sys_shutdown(a0, a1);
 		break;
 	case SYS_SETSOCKOPT:
-		err = sys_setsockopt(a0, a1, a[2], (char __user *)a[3], a[4]);
+		err = __sys_setsockopt(a0, a1, a[2], (char __user *)a[3],
+				       a[4]);
 		break;
 	case SYS_GETSOCKOPT:
 		err =
-		    sys_getsockopt(a0, a1, a[2], (char __user *)a[3],
-				   (int __user *)a[4]);
+		    __sys_getsockopt(a0, a1, a[2], (char __user *)a[3],
+				     (int __user *)a[4]);
 		break;
 	case SYS_SENDMSG:
 		err = sys_sendmsg(a0, (struct user_msghdr __user *)a1, a[2]);
@@ -3187,6 +3214,7 @@ static int compat_sock_ioctl_trans(struct file *file, struct socket *sock,
 	case SIOCSARP:
 	case SIOCGARP:
 	case SIOCDARP:
+	case SIOCOUTQNSD:
 	case SIOCATMARK:
 		return sock_do_ioctl(net, sock, cmd, arg);
 	}
@@ -3329,6 +3357,19 @@ int kernel_sendpage(struct socket *sock, struct page *page, int offset,
 }
 EXPORT_SYMBOL(kernel_sendpage);
 
+int kernel_sendpage_locked(struct sock *sk, struct page *page, int offset,
+			   size_t size, int flags)
+{
+	struct socket *sock = sk->sk_socket;
+
+	if (sock->ops->sendpage_locked)
+		return sock->ops->sendpage_locked(sk, page, offset, size,
+						  flags);
+
+	return sock_no_sendpage_locked(sk, page, offset, size, flags);
+}
+EXPORT_SYMBOL(kernel_sendpage_locked);
+
 int kernel_sock_ioctl(struct socket *sock, int cmd, unsigned long arg)
 {
 	mm_segment_t oldfs = get_fs();
@@ -3347,3 +3388,49 @@ int kernel_sock_shutdown(struct socket *sock, enum sock_shutdown_cmd how)
 	return sock->ops->shutdown(sock, how);
 }
 EXPORT_SYMBOL(kernel_sock_shutdown);
+
+/* This routine returns the IP overhead imposed by a socket i.e.
+ * the length of the underlying IP header, depending on whether
+ * this is an IPv4 or IPv6 socket and the length from IP options turned
+ * on at the socket. Assumes that the caller has a lock on the socket.
+ */
+u32 kernel_sock_ip_overhead(struct sock *sk)
+{
+	struct inet_sock *inet;
+	struct ip_options_rcu *opt;
+	u32 overhead = 0;
+	bool owned_by_user;
+#if IS_ENABLED(CONFIG_IPV6)
+	struct ipv6_pinfo *np;
+	struct ipv6_txoptions *optv6 = NULL;
+#endif /* IS_ENABLED(CONFIG_IPV6) */
+
+	if (!sk)
+		return overhead;
+
+	owned_by_user = sock_owned_by_user(sk);
+	switch (sk->sk_family) {
+	case AF_INET:
+		inet = inet_sk(sk);
+		overhead += sizeof(struct iphdr);
+		opt = rcu_dereference_protected(inet->inet_opt,
+						owned_by_user);
+		if (opt)
+			overhead += opt->opt.optlen;
+		return overhead;
+#if IS_ENABLED(CONFIG_IPV6)
+	case AF_INET6:
+		np = inet6_sk(sk);
+		overhead += sizeof(struct ipv6hdr);
+		if (np)
+			optv6 = rcu_dereference_protected(np->opt,
+							  owned_by_user);
+		if (optv6)
+			overhead += (optv6->opt_flen + optv6->opt_nflen);
+		return overhead;
+#endif /* IS_ENABLED(CONFIG_IPV6) */
+	default: /* Returns 0 overhead if the socket is not ipv4 or ipv6 */
+		return overhead;
+	}
+}
+EXPORT_SYMBOL(kernel_sock_ip_overhead);

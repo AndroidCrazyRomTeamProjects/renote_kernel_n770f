@@ -70,10 +70,11 @@
 #include <net/checksum.h>
 #include <net/tcp_states.h>
 #include <linux/net_tstamp.h>
-// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+
+/* START_OF_KNOX_NPA */
 #define NAP_PROCESS_NAME_LEN	128
 #define NAP_DOMAIN_NAME_LEN	255
-// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+/* END_OF_KNOX_NPA */
 
 /*
  * This structure really needs to be cleaned up.
@@ -215,7 +216,7 @@ struct sock_common {
 		struct hlist_node	skc_node;
 		struct hlist_nulls_node skc_nulls_node;
 	};
-	int			skc_tx_queue_mapping;
+	unsigned short		skc_tx_queue_mapping;
 	union {
 		int		skc_incoming_cpu;
 		u32		skc_rcv_wnd;
@@ -382,7 +383,7 @@ struct sock {
 #ifdef CONFIG_XFRM
 	struct xfrm_policy __rcu *sk_policy[2];
 #endif
-	struct dst_entry	*sk_rx_dst;
+	struct dst_entry __rcu	*sk_rx_dst;
 	struct dst_entry __rcu	*sk_dst_cache;
 	/* Note: 32bit hole on 64bit arches */
 	atomic_t		sk_wmem_alloc;
@@ -394,6 +395,21 @@ struct sock {
 	 * Because of non atomicity rules, all
 	 * changes are protected by socket lock.
 	 */
+	unsigned int		__sk_flags_offset[0];
+#ifdef __BIG_ENDIAN_BITFIELD
+#define SK_FL_PROTO_SHIFT  16
+#define SK_FL_PROTO_MASK   0x00ff0000
+
+#define SK_FL_TYPE_SHIFT   0
+#define SK_FL_TYPE_MASK    0x0000ffff
+#else
+#define SK_FL_PROTO_SHIFT  8
+#define SK_FL_PROTO_MASK   0x0000ff00
+
+#define SK_FL_TYPE_SHIFT   16
+#define SK_FL_TYPE_MASK    0xffff0000
+#endif
+
 	kmemcheck_bitfield_begin(flags);
 	unsigned int		sk_padding : 2,
 				sk_no_check_tx : 1,
@@ -413,7 +429,6 @@ struct sock {
 	int			sk_gso_type;
 	unsigned int		sk_gso_max_size;
 	u16			sk_gso_max_segs;
-	u8			sk_pacing_shift;
 	int			sk_rcvlowat;
 	unsigned long	        sk_lingertime;
 	struct sk_buff_head	sk_error_queue;
@@ -426,8 +441,10 @@ struct sock {
 	__u32			sk_priority;
 	__u32			sk_mark;
 	kuid_t			sk_uid;
+	spinlock_t		sk_peer_lock;
 	struct pid		*sk_peer_pid;
 	const struct cred	*sk_peer_cred;
+
 	long			sk_rcvtimeo;
 	long			sk_sndtimeo;
 	struct timer_list	sk_timer;
@@ -449,7 +466,7 @@ struct sock {
 #endif
 	struct sock_cgroup_data	sk_cgrp_data;
 	struct mem_cgroup	*sk_memcg;
-	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+	/* START_OF_KNOX_NPA */
 	uid_t			knox_uid;
 	pid_t			knox_pid;
 	uid_t			knox_dns_uid;
@@ -460,7 +477,7 @@ struct sock {
 	char			parent_process_name[NAP_PROCESS_NAME_LEN];
 	pid_t			knox_dns_pid;
 	char 			dns_process_name[NAP_PROCESS_NAME_LEN];
-	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+	/* END_OF_KNOX_NPA */
 	void			(*sk_state_change)(struct sock *sk);
 	void			(*sk_data_ready)(struct sock *sk);
 	void			(*sk_write_space)(struct sock *sk);
@@ -679,6 +696,11 @@ static inline void __sk_nulls_add_node_rcu(struct sock *sk, struct hlist_nulls_h
 	hlist_nulls_add_head_rcu(&sk->sk_nulls_node, list);
 }
 
+static inline void __sk_nulls_add_node_tail_rcu(struct sock *sk, struct hlist_nulls_head *list)
+{
+	hlist_nulls_add_tail_rcu(&sk->sk_nulls_node, list);
+}
+
 static inline void sk_nulls_add_node_rcu(struct sock *sk, struct hlist_nulls_head *list)
 {
 	sock_hold(sk);
@@ -767,6 +789,9 @@ enum sock_flags {
 	SOCK_FILTER_LOCKED, /* Filter cannot be changed anymore */
 	SOCK_SELECT_ERR_QUEUE, /* Wake select on error queue */
 	SOCK_RCU_FREE, /* wait rcu grace period in sk_destruct() */
+#ifdef CONFIG_MPTCP
+	SOCK_MPTCP, /* MPTCP set on this socket */
+#endif
 };
 
 #define SK_FLAGS_TIMESTAMP ((1UL << SOCK_TIMESTAMP) | (1UL << SOCK_TIMESTAMPING_RX_SOFTWARE))
@@ -797,6 +822,8 @@ static inline int sk_memalloc_socks(void)
 {
 	return static_key_false(&memalloc_socks);
 }
+
+void __receive_sock(struct file *file);
 #else
 
 static inline int sk_memalloc_socks(void)
@@ -804,6 +831,8 @@ static inline int sk_memalloc_socks(void)
 	return 0;
 }
 
+static inline void __receive_sock(struct file *file)
+{ }
 #endif
 
 static inline gfp_t sk_gfp_mask(const struct sock *sk, gfp_t gfp_mask)
@@ -971,6 +1000,17 @@ static inline bool sk_flush_backlog(struct sock *sk)
 }
 
 int sk_wait_data(struct sock *sk, long *timeo, const struct sk_buff *skb);
+#ifdef CONFIG_MPTCP
+/* START - needed for MPTCP */
+struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority, int family);
+void sock_lock_init(struct sock *sk);
+
+extern struct lock_class_key af_callback_keys[AF_MAX];
+extern char *const af_family_clock_key_strings[AF_MAX+1];
+
+#define SK_FLAGS_TIMESTAMP ((1UL << SOCK_TIMESTAMP) | (1UL << SOCK_TIMESTAMPING_RX_SOFTWARE))
+/* END - needed for MPTCP */
+#endif
 
 struct request_sock_ops;
 struct timewait_sock_ops;
@@ -996,6 +1036,9 @@ static inline void sk_prot_clear_nulls(struct sock *sk, int size)
 struct proto {
 	void			(*close)(struct sock *sk,
 					long timeout);
+	int			(*pre_connect)(struct sock *sk,
+					struct sockaddr *uaddr,
+					int addr_len);
 	int			(*connect)(struct sock *sk,
 					struct sockaddr *uaddr,
 					int addr_len);
@@ -1046,7 +1089,9 @@ struct proto {
 	void			(*unhash)(struct sock *sk);
 	void			(*rehash)(struct sock *sk);
 	int			(*get_port)(struct sock *sk, unsigned short snum);
-
+#ifdef CONFIG_MPTCP
+	void			(*clear_sk)(struct sock *sk, int size);
+#endif
 	/* Keeping track of sockets in use */
 #ifdef CONFIG_PROC_FS
 	unsigned int		inuse_idx;
@@ -1219,7 +1264,7 @@ static inline void sk_sockets_allocated_inc(struct sock *sk)
 	percpu_counter_inc(sk->sk_prot->sockets_allocated);
 }
 
-static inline int
+static inline u64
 sk_sockets_allocated_read_positive(struct sock *sk)
 {
 	return percpu_counter_read_positive(sk->sk_prot->sockets_allocated);
@@ -1553,11 +1598,14 @@ int sock_no_shutdown(struct socket *, int);
 int sock_no_getsockopt(struct socket *, int , int, char __user *, int __user *);
 int sock_no_setsockopt(struct socket *, int, int, char __user *, unsigned int);
 int sock_no_sendmsg(struct socket *, struct msghdr *, size_t);
+int sock_no_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t len);
 int sock_no_recvmsg(struct socket *, struct msghdr *, size_t, int);
 int sock_no_mmap(struct file *file, struct socket *sock,
 		 struct vm_area_struct *vma);
 ssize_t sock_no_sendpage(struct socket *sock, struct page *page, int offset,
 			 size_t size, int flags);
+ssize_t sock_no_sendpage_locked(struct sock *sk, struct page *page,
+				int offset, size_t size, int flags);
 
 /*
  * Functions to fill in entries in struct proto_ops when a protocol
@@ -1629,22 +1677,29 @@ static inline int sk_receive_skb(struct sock *sk, struct sk_buff *skb,
 
 static inline void sk_tx_queue_set(struct sock *sk, int tx_queue)
 {
+	/* sk_tx_queue_mapping accept only upto a 16-bit value */
+	if (WARN_ON_ONCE((unsigned short)tx_queue >= USHRT_MAX))
+		return;
 	sk->sk_tx_queue_mapping = tx_queue;
 }
 
+#define NO_QUEUE_MAPPING	USHRT_MAX
+
 static inline void sk_tx_queue_clear(struct sock *sk)
 {
-	sk->sk_tx_queue_mapping = -1;
+	sk->sk_tx_queue_mapping = NO_QUEUE_MAPPING;
 }
 
 static inline int sk_tx_queue_get(const struct sock *sk)
 {
-	return sk ? sk->sk_tx_queue_mapping : -1;
+	if (sk && sk->sk_tx_queue_mapping != NO_QUEUE_MAPPING)
+		return sk->sk_tx_queue_mapping;
+
+	return -1;
 }
 
 static inline void sk_set_socket(struct sock *sk, struct socket *sock)
 {
-	sk_tx_queue_clear(sk);
 	sk->sk_socket = sock;
 }
 
@@ -1697,7 +1752,8 @@ static inline u32 net_tx_rndhash(void)
 
 static inline void sk_set_txhash(struct sock *sk)
 {
-	sk->sk_txhash = net_tx_rndhash();
+	/* This pairs with READ_ONCE() in skb_set_hash_from_sk() */
+	WRITE_ONCE(sk->sk_txhash, net_tx_rndhash());
 }
 
 static inline void sk_rethink_txhash(struct sock *sk)
@@ -1952,9 +2008,12 @@ static inline void sock_poll_wait(struct file *filp,
 
 static inline void skb_set_hash_from_sk(struct sk_buff *skb, struct sock *sk)
 {
-	if (sk->sk_txhash) {
+	/* This pairs with WRITE_ONCE() in sk_set_txhash() */
+	u32 txhash = READ_ONCE(sk->sk_txhash);
+
+	if (txhash) {
 		skb->l4_hash = 1;
-		skb->hash = sk->sk_txhash;
+		skb->hash = txhash;
 	}
 }
 
@@ -2069,18 +2128,27 @@ struct sk_buff *sk_stream_alloc_skb(struct sock *sk, int size, gfp_t gfp,
  * sk_page_frag - return an appropriate page_frag
  * @sk: socket
  *
- * If socket allocation mode allows current thread to sleep, it means its
- * safe to use the per task page_frag instead of the per socket one.
+ * Use the per task page_frag instead of the per socket one for
+ * optimization when we know that we're in the normal context and owns
+ * everything that's associated with %current.
+ *
+ * gfpflags_allow_blocking() isn't enough here as direct reclaim may nest
+ * inside other socket operations and end up recursing into sk_page_frag()
+ * while it's already in use.
  */
 static inline struct page_frag *sk_page_frag(struct sock *sk)
 {
-	if (gfpflags_allow_blocking(sk->sk_allocation))
+	if (gfpflags_normal_context(sk->sk_allocation))
 		return &current->task_frag;
 
 	return &sk->sk_frag;
 }
 
 bool sk_page_frag_refill(struct sock *sk, struct page_frag *pfrag);
+
+int sk_alloc_sg(struct sock *sk, int len, struct scatterlist *sg,
+		int sg_start, int *sg_curr, unsigned int *sg_size,
+		int first_coalesce);
 
 /*
  *	Default write policy as shown to user space via poll/select/SIGIO
@@ -2161,7 +2229,7 @@ static inline ktime_t sock_read_timestamp(struct sock *sk)
 
 	return kt;
 #else
-	return sk->sk_stamp;
+	return READ_ONCE(sk->sk_stamp);
 #endif
 }
 
@@ -2172,7 +2240,7 @@ static inline void sock_write_timestamp(struct sock *sk, ktime_t kt)
 	sk->sk_stamp = kt;
 	write_sequnlock(&sk->sk_stamp_seq);
 #else
-	sk->sk_stamp = kt;
+	WRITE_ONCE(sk->sk_stamp, kt);
 #endif
 }
 
@@ -2340,16 +2408,5 @@ extern int sysctl_optmem_max;
 
 extern __u32 sysctl_wmem_default;
 extern __u32 sysctl_rmem_default;
-
-/* Default TCP Small queue budget is ~1 ms of data (1sec >> 10)
- * Some wifi drivers need to tweak it to get more chunks.
- * They can use this helper from their ndo_start_xmit()
- */
-static inline void sk_pacing_shift_update(struct sock *sk, int val)
-{
-	if (!sk || !sk_fullsock(sk) || sk->sk_pacing_shift == val)
-		return;
-	sk->sk_pacing_shift = val;
-}
 
 #endif	/* _SOCK_H */

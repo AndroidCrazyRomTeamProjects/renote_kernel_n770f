@@ -286,6 +286,29 @@ static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
 	return !!(gfp_flags & __GFP_DIRECT_RECLAIM);
 }
 
+/**
+ * gfpflags_normal_context - is gfp_flags a normal sleepable context?
+ * @gfp_flags: gfp_flags to test
+ *
+ * Test whether @gfp_flags indicates that the allocation is from the
+ * %current context and allowed to sleep.
+ *
+ * An allocation being allowed to block doesn't mean it owns the %current
+ * context.  When direct reclaim path tries to allocate memory, the
+ * allocation context is nested inside whatever %current was doing at the
+ * time of the original allocation.  The nested allocation may be allowed
+ * to block but modifying anything %current owns can corrupt the outer
+ * context's expectations.
+ *
+ * %true result from this function indicates that the allocation context
+ * can sleep and use anything that's associated with %current.
+ */
+static inline bool gfpflags_normal_context(const gfp_t gfp_flags)
+{
+	return (gfp_flags & (__GFP_DIRECT_RECLAIM | __GFP_MEMALLOC)) ==
+		__GFP_DIRECT_RECLAIM;
+}
+
 #ifdef CONFIG_HIGHMEM
 #define OPT_ZONE_HIGHMEM ZONE_HIGHMEM
 #else
@@ -508,9 +531,9 @@ extern void free_hot_cold_page(struct page *page, bool cold);
 extern void free_hot_cold_page_list(struct list_head *list, bool cold);
 
 struct page_frag_cache;
-extern void *__alloc_page_frag(struct page_frag_cache *nc,
-			       unsigned int fragsz, gfp_t gfp_mask);
-extern void __free_page_frag(void *addr);
+extern void *page_frag_alloc(struct page_frag_cache *nc,
+			     unsigned int fragsz, gfp_t gfp_mask);
+extern void page_frag_free(void *addr);
 
 #define __free_page(page) __free_pages((page), 0)
 #define free_page(addr) free_pages((addr), 0)
