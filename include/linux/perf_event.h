@@ -476,6 +476,7 @@ struct pmu {
  */
 struct perf_addr_filter {
 	struct list_head	entry;
+	struct path		    path;
 	struct inode		*inode;
 	unsigned long		offset;
 	unsigned long		size;

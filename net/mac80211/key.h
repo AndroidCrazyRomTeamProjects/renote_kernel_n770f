@@ -126,6 +126,7 @@ struct ieee80211_key {
 		int cnt;
 	} debugfs;
 #endif
+unsigned int color;
 
 	/*
 	 * key config, must be last because it contains key

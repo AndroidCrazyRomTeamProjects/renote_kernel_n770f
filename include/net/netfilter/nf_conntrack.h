@@ -26,10 +26,10 @@
 
 #include <net/netfilter/nf_conntrack_tuple.h>
 
-// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+// KNOX NPA - START
 #define PROCESS_NAME_LEN_NAP	128
 #define DOMAIN_NAME_LEN_NAP	255
-// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+// KNOX NPA - END
 /* per conntrack: protocol private data */
 union nf_conntrack_proto {
 	/* insert conntrack proto private data here */
@@ -107,7 +107,7 @@ struct nf_conn {
 	struct hlist_node	nat_bysource;
 #endif
 	/* all members below initialized via memset */
-	u8 __nfct_init_offset[0];
+	struct { } __nfct_init_offset;
 
 	/* If we were expected by an expectation, this will be it */
 	struct nf_conn *master;
@@ -125,7 +125,9 @@ struct nf_conn {
 
 	/* Storage reserved for other modules, must be the last member */
 	union nf_conntrack_proto proto;
-	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+
+
+	// KNOX NPA - START
 	/* The number of application layer bytes sent by the socket */
 	__u64   knox_sent;
 	/* The number of application layer bytes recieved by the socket */
@@ -155,7 +157,8 @@ struct nf_conn {
 	u32 npa_timeout;
 	/* Atomic variable indicating end of intermediate flow */
 	atomic_t intermediateFlow;
-	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+	// KNOX NPA - END
+
 };
 
 static inline struct nf_conn *

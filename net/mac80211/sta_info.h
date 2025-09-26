@@ -373,6 +373,26 @@ struct mesh_sta {
 	/* moving percentage of failed MSDUs */
 	unsigned int fail_avg;
 };
+#define IEEE80211_FRAGMENT_MAX 4
+
+
+struct ieee80211_fragment_entry {
+	struct sk_buff_head skb_list;
+	unsigned long first_frag_time;
+	u16 seq;
+	u16 extra_len;
+	u16 last_frag;
+	u8 rx_queue;
+	u8 check_sequential_pn:1, /* needed for CCMP/GCMP */
+	   is_protected:1;
+	u8 last_pn[6]; /* PN of the last fragment if CCMP was used */
+	unsigned int key_color;
+};
+
+struct ieee80211_fragment_cache {
+	struct ieee80211_fragment_entry	entries[IEEE80211_FRAGMENT_MAX];
+	unsigned int next;
+};
 
 DECLARE_EWMA(signal, 1024, 8)
 
@@ -550,6 +570,8 @@ struct sta_info {
 	u8 reserved_tid;
 
 	struct cfg80211_chan_def tdls_chandef;
+
+	struct ieee80211_fragment_cache frags;
 
 	/* keep last! */
 	struct ieee80211_sta sta;

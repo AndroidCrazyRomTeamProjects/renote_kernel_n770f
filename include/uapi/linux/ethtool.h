@@ -42,6 +42,10 @@
  * @port: Physical connector type; one of %PORT_*
  * @phy_address: MDIO address of PHY (transceiver); 0 or 255 if not
  *	applicable.  For clause 45 PHYs this is the PRTAD.
+  * @transceiver: Historically used to distinguish different possible
+ *	PHY types, but not in a consistent way.  Deprecated.
+ * @phy_address: MDIO address of PHY (transceiver); 0 or 255 if not
+ *	applicable.  For clause 45 PHYs this is the PRTAD.
  * @transceiver: Historically used to distinguish different possible
  *	PHY types, but not in a consistent way.  Deprecated.
  * @autoneg: Enable/disable autonegotiation and auto-detection;
@@ -1738,6 +1742,7 @@ struct ethtool_link_settings {
 	__u8	eth_tp_mdix;
 	__u8	eth_tp_mdix_ctrl;
 	__s8	link_mode_masks_nwords;
+	__u8	transceiver;
 	__u32	reserved[8];
 	__u32	link_mode_masks[0];
 	/* layout of link_mode_masks fields:

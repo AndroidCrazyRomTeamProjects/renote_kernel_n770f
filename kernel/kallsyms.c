@@ -555,14 +555,20 @@ struct kallsym_iter {
 };
 
 static int get_ksymbol_mod(struct kallsym_iter *iter)
-unsigned long value;
 {
-	if (module_get_kallsym(iter->pos - kallsyms_num_syms, &iter->value,
-				&iter->type, iter->name, iter->module_name,
-				&iter->exported) < 0)
-				value = iter->show_value ? iter->value : 0;
-		return 0;
-	return 1;
+    unsigned long value;
+
+    if (module_get_kallsym(iter->pos - kallsyms_num_syms,
+                           &iter->value,
+                           &iter->type,
+                           iter->name,
+                           iter->module_name,
+                           &iter->exported) < 0) {
+        value = iter->show_value ? iter->value : 0;
+        return 0;
+    }
+
+    return 1;
 }
 
 /* Returns space to next name. */
