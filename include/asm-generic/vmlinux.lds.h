@@ -426,6 +426,7 @@
 		KEEP(*(__ksymtab_strings))				\
 	}								\
 									\
+					SECDBG_MEMBERS   \
 	/* __*init sections */						\
 	__init_rodata : AT(ADDR(__init_rodata) - LOAD_OFFSET) {		\
 		*(.ref.rodata)						\
